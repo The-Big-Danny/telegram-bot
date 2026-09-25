@@ -527,6 +527,8 @@ test("poller: send failure does not prevent cursor from advancing", async () => 
   // A failed send still triggers the spacing because sentThisCycle stays 0.
   // Wait long enough for the full cycle (send attempt + spacing + cursor write).
   await waitFor(() => poller.status().notificationsFailed >= 1 && poller.status().targets.find((t) => t.source === "market").cursor !== null, 20_000);
+  // sendWithRetry (#166) makes 3 attempts with 1s + 2s backoff before the send counts as failed, then spacing and the cursor write follow.
+  await new Promise((r) => setTimeout(r, 5500));
   poller.stop();
 
   const st = poller.status();

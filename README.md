@@ -223,6 +223,10 @@ rather than replaying the whole retained window into your chat. `/pause` and
 `/resume` never edit this file; they only control scheduling, so the cursor
 format remains version 1 and a restart does not preserve a pause.
 
+Tests never use this directory: they run against an ephemeral data directory
+created under the OS temp dir and removed afterwards (see
+[docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events

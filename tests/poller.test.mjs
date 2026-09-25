@@ -29,7 +29,22 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { writeFile } from "node:fs/promises";
 import { createPoller } from "../dist/poller.js";
+import { createTempDataDir } from "./helpers/temp-data.mjs";
+
+// Ephemeral data directory: no test touches the repo data/ dir or fixed /tmp names.
+const dataDir = await createTempDataDir("mimir-poller-");
+test.after(() => dataDir.cleanup());
+
+/** Polls `cond` until true or `timeoutMs` elapses (then fails the test). */
+async function waitFor(cond, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
 
 // ── Fake builder helpers ──────────────────────────────────────────────────────
 
@@ -53,7 +68,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     pollIntervalMs: 100_000, // large: we call cycle() manually
     startLookbackLedgers: 60,
-    cursorFile: "/tmp/test-cursor-not-real.json",
+    cursorFile: dataDir.file("unused-cursor.json"),
     maxNotificationsPerCycle: 5,
     ...overrides,
   };
@@ -189,7 +204,7 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
   };
 
   // We need to intercept cursor writes; use a temporary path that won't exist
-  const tmpCursorPath = `/tmp/poller-test-cursor-${Date.now()}.json`;
+  const tmpCursorPath = dataDir.file("poller-test-cursor.json");
   const config = baseConfig({ cursorFile: tmpCursorPath });
 
   const poller = createPoller({ config, server, send: async () => {} });
@@ -216,32 +231,21 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
 // ── Cursor persistence (corrupt file) ────────────────────────────────────────
 
 test("poller: corrupt cursor file triggers cold start, does not throw", async () => {
-  // Write a corrupt cursor file, start the poller, verify it recovers gracefully.
-  import("node:fs/promises").then(async ({ writeFile, unlink }) => {
-    const tmpPath = `/tmp/corrupt-cursor-${Date.now()}.json`;
-    await writeFile(tmpPath, "{ this is not valid json }", "utf8");
+  const cursorFile = dataDir.file("corrupt-cursor.json");
+  await writeFile(cursorFile, "{ this is not valid json }", "utf8");
 
-    const config = baseConfig({ cursorFile: tmpPath, pollIntervalMs: 9_999_999 });
-    const server = makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
+  const config = baseConfig({ cursorFile, pollIntervalMs: 9_999_999 });
+  const server = makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
+  const poller = createPoller({ config, server, send: async () => {} });
 
-    let threw = false;
-    try {
-      const poller = createPoller({ config, server, send: async () => {} });
-      await poller.start();
-      await new Promise((r) => setTimeout(r, 20));
-      poller.stop();
-    } catch {
-      threw = true;
-    }
-
-    assert.equal(threw, false, "corrupt cursor file must not cause start() to throw");
-    await unlink(tmpPath).catch(() => {});
-  });
+  await poller.start(); // must not reject
+  poller.stop();
+  for (const t of poller.status().targets) assert.equal(t.cursor, null);
 });
 
 test("poller: corrupt cursor JSON results in cold start (cursors remain null after loadCursors)", async () => {
   const { writeFile, unlink } = await import("node:fs/promises");
-  const tmpPath = `/tmp/corrupt-cursor-2-${Date.now()}.json`;
+  const tmpPath = dataDir.file("corrupt-cursor-2.json");
   await writeFile(tmpPath, "<<<not json>>>", "utf8");
 
   const config = baseConfig({ cursorFile: tmpPath, pollIntervalMs: 9_999_999 });
@@ -275,7 +279,7 @@ test("poller: corrupt cursor JSON results in cold start (cursors remain null aft
 
 test("poller: missing cursor file results in cold start, not an error", async () => {
   const config = baseConfig({
-    cursorFile: `/tmp/definitely-does-not-exist-${Date.now()}.json`,
+    cursorFile: dataDir.file("definitely-does-not-exist.json"),
     pollIntervalMs: 9_999_999,
   });
   const server = {
@@ -320,7 +324,7 @@ test("poller: RPC failure for one target does not prevent the other from scannin
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/rpc-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("rpc-fail.json"), pollIntervalMs: 9_999_999 });
   const sent = [];
   const poller = createPoller({ config, server, send: async (msg) => { sent.push(msg); } });
 
@@ -347,7 +351,7 @@ test("poller: consecutiveFailures increments when ALL targets fail", async () =>
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/all-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("all-fail.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -377,7 +381,7 @@ test("poller: consecutiveFailures resets when any target succeeds", async () => 
   };
 
   // Use a fast interval so two cycles can complete quickly
-  const config = baseConfig({ cursorFile: `/tmp/reset-failures-${Date.now()}.json`, pollIntervalMs: 30 });
+  const config = baseConfig({ cursorFile: dataDir.file("reset-failures.json"), pollIntervalMs: 30 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -401,7 +405,7 @@ test("poller: getHealth failure propagates to target error and increments consec
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/health-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("health-fail.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -448,7 +452,7 @@ test("poller: Telegram send rejection increments notificationsFailed but does no
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/tg-fail-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("tg-fail.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => Promise.reject(sendError) });
 
   await poller.start();
@@ -508,7 +512,7 @@ test("poller: send failure does not prevent cursor from advancing", async () => 
   };
 
   const sendAttempts = [];
-  const config = baseConfig({ cursorFile: `/tmp/cursor-advance-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("cursor-advance.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({
     config,
     server,
@@ -522,7 +526,7 @@ test("poller: send failure does not prevent cursor from advancing", async () => 
   // The poller's notify() sleeps SEND_SPACING_MS (1500ms) between messages.
   // A failed send still triggers the spacing because sentThisCycle stays 0.
   // Wait long enough for the full cycle (send attempt + spacing + cursor write).
-  await new Promise((r) => setTimeout(r, 2000));
+  await waitFor(() => poller.status().notificationsFailed >= 1 && poller.status().targets.find((t) => t.source === "market").cursor !== null, 20_000);
   poller.stop();
 
   const st = poller.status();
@@ -575,7 +579,7 @@ test("poller: maxNotificationsPerCycle cap — events beyond cap are skipped", a
 
   const sent = [];
   const config = baseConfig({
-    cursorFile: `/tmp/cap-${Date.now()}.json`,
+    cursorFile: dataDir.file("cap.json"),
     pollIntervalMs: 9_999_999,
     maxNotificationsPerCycle: 3,
   });
@@ -586,10 +590,9 @@ test("poller: maxNotificationsPerCycle cap — events beyond cap are skipped", a
   });
 
   await poller.start();
-  // Cap is 3 but each send has a 1500ms spacing — too slow to wait for.
-  // Instead we just confirm the cap variable is respected by checking status
-  // without waiting for all sends.
-  await new Promise((r) => setTimeout(r, 80));
+  // Each send is spaced 1500ms apart, so wait for the cycle to finish (its cursor
+  // save is the last step) rather than leaving it writing into a removed data dir.
+  await waitFor(() => poller.status().targets.every((t) => t.cursor !== null), 20_000);
   poller.stop();
 
   const st = poller.status();
@@ -617,7 +620,7 @@ test("poller: stop() prevents further cycles after the current one completes", a
   };
 
   // Short poll interval so the timer would fire quickly if stop() didn't work.
-  const config = baseConfig({ cursorFile: `/tmp/stop-${Date.now()}.json`, pollIntervalMs: 20 });
+  const config = baseConfig({ cursorFile: dataDir.file("stop.json"), pollIntervalMs: 20 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -633,7 +636,7 @@ test("poller: stop() prevents further cycles after the current one completes", a
 });
 
 test("poller: status().running is false after stop()", async () => {
-  const config = baseConfig({ cursorFile: `/tmp/running-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("running.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
@@ -651,7 +654,7 @@ test("poller: status().running is false after stop()", async () => {
 
 test("poller: start() sets startedAt and increments cycles on first poll", async () => {
   const tip = 5000;
-  const config = baseConfig({ cursorFile: `/tmp/startedat-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("startedat.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
@@ -691,7 +694,7 @@ test("poller: failed market scan does not update market cursor but squad cursor 
     },
   };
 
-  const config = baseConfig({ cursorFile: `/tmp/iso-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("iso.json"), pollIntervalMs: 9_999_999 });
   const poller = createPoller({ config, server, send: async () => {} });
 
   await poller.start();
@@ -710,7 +713,7 @@ test("poller: failed market scan does not update market cursor but squad cursor 
 // ── Poller status shape ───────────────────────────────────────────────────────
 
 test("poller: status() returns a snapshot, not a live reference", async () => {
-  const config = baseConfig({ cursorFile: `/tmp/snapshot-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("snapshot.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
@@ -734,7 +737,7 @@ test("poller: status() returns a snapshot, not a live reference", async () => {
 });
 
 test("poller: targets list has exactly two entries (market and squad)", async () => {
-  const config = baseConfig({ cursorFile: `/tmp/targets-${Date.now()}.json`, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({ cursorFile: dataDir.file("targets.json"), pollIntervalMs: 9_999_999 });
   const server = {
     async getHealth() {
       return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
@@ -753,149 +756,4 @@ test("poller: targets list has exactly two entries (market and squad)", async ()
   assert.equal(st.targets.length, 2);
   const sources = st.targets.map((t) => t.source).sort();
   assert.deepEqual(sources, ["market", "squad"]);
-import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import test from "node:test";
-
-import { createPoller } from "../dist/poller.js";
-
-const CURSOR_FILE = JSON.stringify({
-  version: 1,
-  updatedAt: "2026-09-24T00:00:00.000Z",
-  targets: {
-    market: { cursor: "123-0", lastEventLedger: 40 },
-    squad: { cursor: "456-0", lastEventLedger: 41 },
-  },
-});
-
-function baseConfig(cursorFile) {
-  return {
-    marketContractId: "C" + "A".repeat(55),
-    squadContractId: "C" + "B".repeat(55),
-    rpcUrl: "https://example.invalid/rpc",
-    horizonUrl: "https://example.invalid/horizon",
-    networkPassphrase: "Test SDF Network ; September 2015",
-    explorerBaseUrl: "https://example.invalid/explorer",
-    botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
-    chatId: "-1001234567890",
-    operatorTelegramUserId: "42",
-    pollIntervalMs: 5_000,
-    startLookbackLedgers: 60,
-    cursorFile,
-    maxNotificationsPerCycle: 20,
-    healthHost: "127.0.0.1",
-    healthPort: 0,
-    healthStaleMs: 90_000,
-  };
-}
-
-function stuckServer() {
-  return {
-    getHealth: async () => new Promise(() => undefined),
-  };
-}
-
-async function waitForFailedCycle(poller) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (poller.status().consecutiveFailures > 0) return;
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-  throw new Error("poller failure cycle did not finish");
-}
-
-test("pause/resume is bounded during an in-flight scan and restart reloads version-1 cursors", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-resume-"));
-  const cursorFile = path.join(directory, "cursor.json");
-  await writeFile(cursorFile, CURSOR_FILE, "utf8");
-
-  const first = createPoller({
-    config: baseConfig(cursorFile),
-    server: stuckServer(),
-    send: async () => undefined,
-  });
-
-  try {
-    await first.start();
-    assert.equal(first.status().paused, false);
-    assert.equal(first.status().running, true);
-    assert.equal(first.status().targets[0].cursor, "123-0");
-
-    assert.equal(first.pause(), "paused");
-    assert.equal(first.status().paused, true);
-    assert.equal(first.pause(), "already-paused");
-    assert.equal(first.resume(), "resumed");
-    assert.equal(first.status().paused, false);
-    assert.equal(first.resume(), "already-running");
-
-    // Operator control never rewrites the version-1 cursor compatibility shape.
-    assert.equal(JSON.parse(await readFile(cursorFile, "utf8")).version, 1);
-  } finally {
-    first.stop();
-  }
-
-  const second = createPoller({
-    config: baseConfig(cursorFile),
-    server: stuckServer(),
-    send: async () => undefined,
-  });
-  try {
-    await second.start();
-    assert.equal(second.status().paused, false, "pause must not survive a process restart");
-    assert.equal(second.status().targets[1].cursor, "456-0");
-  } finally {
-    second.stop();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("stopped poller rejects both operator controls", () => {
-  const poller = createPoller({
-    config: baseConfig("/tmp/unused-mimir-cursor.json"),
-    server: stuckServer(),
-    send: async () => undefined,
-  });
-
-  poller.stop();
-  assert.equal(poller.pause(), "stopped");
-  assert.equal(poller.resume(), "stopped");
-  assert.equal(poller.status().running, false);
-  assert.equal(poller.status().paused, false);
-});
-
-test("RPC failures are bounded and redact the configured bot token in status", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-rpc-failure-"));
-  const cursorFile = path.join(directory, "cursor.json");
-  await writeFile(cursorFile, CURSOR_FILE, "utf8");
-  const secret = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
-  const longPayload = "remote-payload".repeat(100);
-  const poller = createPoller({
-    config: baseConfig(cursorFile),
-    server: {
-      getHealth: async () => {
-        throw new Error(`${secret} ${longPayload}`);
-      },
-    },
-    send: async () => undefined,
-  });
-  const originalError = console.error;
-  const logs = [];
-  console.error = (...args) => logs.push(args.join(" "));
-
-  try {
-    await poller.start();
-    await waitForFailedCycle(poller);
-    const status = poller.status();
-    assert.equal(status.consecutiveFailures, 1);
-    assert.equal(status.targets.find((target) => target.source === "market").cursor, "123-0");
-    assert.match(status.lastError.message, /^(market|squad): /);
-    assert.equal(status.lastError.message.includes(secret), false);
-    assert.ok(status.lastError.message.length <= 250);
-    assert.equal(logs.join("\n").includes(secret), false);
-  } finally {
-    console.error = originalError;
-    poller.stop();
-    await rm(directory, { recursive: true, force: true });
-  }
 });

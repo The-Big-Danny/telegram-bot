@@ -9,9 +9,11 @@
 
 import { Bot, type Context } from "grammy";
 
-import { escapeMd, safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
+export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
+import { buildHealthReport } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 
 const HELP_BASE = [
@@ -21,6 +23,8 @@ const HELP_BASE = [
   "",
   "/status — what I am watching and how far I have read",
   "/contracts — the contract ids I watch and where to look them up",
+  "/health — health assessment and operational readiness",
+  "/preview — preview channel notification formatting",
   "/help — this message",
 ];
 
@@ -53,9 +57,10 @@ function cursorPreview(cursor: string | null): string {
   return compact.length <= 24 ? compact : `${compact.slice(0, 23)}…`;
 }
 
-function statusMessage(config: BotConfig, status: PollerStatus): string {
+function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = Date.now()): string {
   const lines: string[] = [
     `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `Channel preview: ${config.channelPreviewMode ? "enabled" : "disabled"}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
@@ -94,6 +99,53 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
  * between restarts, or wedged on a run of RPC failures. `/status` is for
  * "is it working"; this is for "what is it even watching".
  */
+export function healthMessage(
+  config: BotConfig,
+  status: PollerStatus,
+  nowMs: number = Date.now(),
+): string {
+  const report = buildHealthReport(config, status, nowMs);
+  const statusLabel = report.status.toUpperCase();
+
+  const lines: string[] = [
+    `*Health* — ${escapeMd(statusLabel)} on Stellar ${networkLabel(config)}`,
+    "",
+    `Status: \`${report.status}\` \\(${report.ok ? "ok" : "action required"}\\)`,
+    `Poller: ${report.poller.running ? "running" : "stopped"}`,
+    `Uptime: ${report.uptimeMs > 0 ? ago(nowMs - report.uptimeMs, nowMs) : "0s"}`,
+    `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
+    `Last successful poll: ${ago(status.lastSuccessAt, nowMs)}`,
+    `Chain tip: ${report.poller.latestLedger ?? "unknown"}`,
+    `Cycles: ${report.poller.cycles} · consecutive failures: ${report.poller.consecutiveFailures}`,
+    `Notifications: sent ${report.poller.notificationsSent} · failed ${report.poller.notificationsFailed} · skipped ${report.poller.eventsSkipped}`,
+    "",
+    "*Watched Contracts*",
+  ];
+
+  for (const target of report.poller.targets) {
+    lines.push(
+      `· mimir\\-${target.source} \`${target.contractId}\``,
+      `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
+      `  cursor: \`${target.cursorPreview ?? "none (cold start)"}\``,
+    );
+    if (target.hasError) {
+      const targetState = status.targets.find((t) => t.source === target.source);
+      if (targetState?.lastError) {
+        lines.push(`  last error: ${escapeMd(targetState.lastError)}`);
+      }
+    }
+  }
+
+  if (report.poller.lastError) {
+    lines.push(
+      "",
+      `Last error \\(${ago(status.lastError?.at ?? null, nowMs)}\\): ${escapeMd(report.poller.lastError.message)}`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
 export function contractsMessage(config: BotConfig): string {
   const targets: Array<{ label: string; contractId: string }> = [
     { label: "mimir\\-market", contractId: config.marketContractId },
@@ -171,8 +223,19 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
 
   // Config-only, so this never fails on account of poller or RPC state —
   // unlike /status, it has nothing to report failure on.
+  bot.command("health", async (ctx) => {
+    await ctx.reply(healthMessage(config, status()), TELEGRAM_OPTIONS);
+  });
+
   bot.command("contracts", async (ctx) => {
     await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
+  });
+
+  bot.command("preview", async (ctx) => {
+    const text = ctx.message?.text ?? "";
+    const spaceIndex = text.indexOf(" ");
+    const arg = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
+    await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
   });
 
   bot.command("pause", async (ctx) => {
@@ -223,6 +286,8 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
       { command: "contracts", description: "Contract ids and explorer links" },
+      { command: "health", description: "Health assessment and operational readiness" },
+      { command: "preview", description: "Preview channel notification formatting" },
       { command: "pause", description: "Operator only: pause new scans" },
       { command: "resume", description: "Operator only: resume polling now" },
     ]);
